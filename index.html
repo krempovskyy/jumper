@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Symbiotic Runner</title>
+<style>
+  :root{
+    --bg-day:#0a0a0a;
+    --bg-night:#000000;
+    --neon:#39ff14;
+    --fg:#e5e5e5;
+  }
+  html,body{
+    margin:0; height:100%; background:#000; color:var(--fg);
+    font-family: system-ui,-apple-system,"Segoe UI",Roboto,Ubuntu,sans-serif;
+    overflow:hidden;
+  }
+  #wrap{
+    height:100%; display:flex; align-items:center; justify-content:center;
+    background:#000;
+  }
+  canvas{
+    border:2px solid var(--neon);
+    background:#000;
+    max-width:100%;
+    image-rendering: pixelated;
+  }
+  .hint{
+    position:fixed; bottom:10px; left:50%; transform:translateX(-50%);
+    font-size:12px; opacity:.35; color:#aaa; pointer-events:none;
+  }
+  #overlay{
+    position:fixed; inset:0;
+    background:rgba(0,0,0,.8);
+    display:flex; align-items:center; justify-content:center;
+    z-index:10;
+  }
+  #overlay .box{
+    text-align:center; color:var(--neon); max-width:90%;
+  }
+  #overlay h1{ margin:0 0 12px 0; font-size:42px; }
+  #overlay p{ margin:6px 0; color:#ccc; }
+  #overlay .btn{
+    display:inline-block; margin-top:18px; padding:10px 18px;
+    border:2px solid var(--neon); color:var(--neon);
+    border-radius:6px; cursor:pointer; user-select:none;
+  }
+  #overlay .btn:hover{ background:var(--neon); color:#000; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="1280" height="360"></canvas>
+</div>
+<div class="hint">Jump: Space / W / ↑ • Duck: S / ↓ • Restart/Start: Space or Click</div>
+
+<div id="overlay">
+  <div class="box">
+    <h1 id="ovTitle">Symbiotic Runner</h1>
+    <p id="ovSubtitle">Press <b>Space</b> or <b>Click</b> to start</p>
+    <div class="btn" id="ovBtn">Start</div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  // Custom character sprite
+  const charImg = new Image();
+  charImg.src = 'char.png';
+
+  // Overlay
+  const overlay = document.getElementById('overlay');
+  const ovTitle = document.getElementById('ovTitle');
+  const ovSubtitle = document.getElementById('ovSubtitle');
+  const ovBtn = document.getElementById('ovBtn');
+
+  // Colors
+  const NEON = getComputedStyle(document.documentElement).getPropertyValue('--neon').trim() || '#39ff14';
+  const BG_DAY = getComputedStyle(document.documentElement).getPropertyValue('--bg-day').trim() || '#0a0a0a';
+  const BG_NIGHT = getComputedStyle(document.documentElement).getPropertyValue('--bg-night').trim() || '#000000';
+
+  // Consts
+  const WIDTH = canvas.width | 0;
+  const HEIGHT = canvas.height | 0;
+  const GROUND_Y = (HEIGHT - 60) | 0;
+
+  const GRAVITY = 0.0022;
+  const JUMP_VEL = -0.78;
+  const INITIAL_SPEED = 0.38;
+  const SPEED_INC = 0.00004;
+
+  const OBST_COOLDOWN = 650;
+  const CLOUD_MIN = 2000, CLOUD_MAX = 4000;
+  const STAR_COUNT = 40;
+  const DAY_NIGHT_EVERY = 25000;
+
+  const RUN_FRAME_TIME  = 120;
+  const BIRD_FRAME_TIME = 120;
+
+  const MAX_OBSTACLES = 12;
+  const MAX_CLOUDS = 12;
+
+  const PLAYER = { x:80, y:0, w:46, h:48, vy:0, onGround:true, state:'run', runFrame:0, duckFrame:0 };
+
+  // State
+  let state = 'ready';
+  let speed, score, best, running, over, last;
+  let lastObstacleAt;
+  let isNight, dayNightTimer;
+
+  // next spawn timestamps (ms)
+  let nextGroundAt = 0;
+  let nextBirdAt   = 0;
+  let nextCloudAt  = 0;
+
+  let obstacles = [];
+  let clouds = [];
+  let stars = [];
+
+  // ---------- UI ----------
+  function showStart() {
+    ovTitle.textContent = 'Symbiotic Runner';
+    ovSubtitle.innerHTML = 'Press <b>Space</b> or <b>Click</b> to start';
+    ovBtn.textContent = 'Start';
+    overlay.style.display = 'flex';
+    state = 'ready';
+    running = false;
+    over = false;
+  }
+  function showGameOver() {
+    ovTitle.textContent = 'Game Over';
+    ovSubtitle.innerHTML = `Score: ${Math.floor(score)} • Best: ${Math.floor(best)}<br>Press <b>Space</b> or <b>Click</b> to restart`;
+    ovBtn.textContent = 'Restart';
+    overlay.style.display = 'flex';
+    state = 'gameover';
+  }
+  function hideOverlay(){ overlay.style.display = 'none'; }
+
+  // ---------- Helpers ----------
+  function initStars(){
+    stars = [];
+    for(let i=0;i<STAR_COUNT;i++){
+      stars.push({ x:Math.random()*WIDTH, y:Math.random()*120, r:Math.random()*1.8+0.2, a:Math.random()*0.5+0.5 });
+    }
+  }
+
+  function startGame(){ hideOverlay(); reset(); }
+
+  function reset(){
+    speed = INITIAL_SPEED;
+    score = 0;
+    best  = Number(localStorage.getItem('neon_dino_best')) || 0;
+    running = true;
+    over = false;
+    state = 'running';
+
+    last = performance.now();
+    lastObstacleAt = -Infinity;
+
+    // заранее расписанные спавны
+    const now = last;
+    nextGroundAt = now + randInt(850, 1400);
+    nextBirdAt   = now + 9999999; // активируется после 250 score
+    nextCloudAt  = now + randInt(CLOUD_MIN, CLOUD_MAX);
+
+    dayNightTimer = 0;
+    isNight = false;
+    initStars();
+
+    obstacles.length = 0;
+    clouds.length = 0;
+
+    PLAYER.y = GROUND_Y - PLAYER.h;
+    PLAYER.vy = 0;
+    PLAYER.onGround = true;
+    PLAYER.state = 'run';
+    PLAYER.runFrame = 0;
+    PLAYER.duckFrame = 0;
+
+    loop(last);
+  }
+
+  // ---------- Input ----------
+  function tryStartOrRestart(){
+    if (state === 'ready' || state === 'gameover') {
+      startGame();
+      return true;
+    }
+    return false;
+  }
+
+  function jump(){
+    if (state !== 'running') return;
+    if (PLAYER.onGround){
+      PLAYER.vy = JUMP_VEL;
+      PLAYER.onGround = false;
+      PLAYER.state = 'jump';
+    }
+  }
+
+  function duck(d){
+    if (state !== 'running') return;
+    if (d && PLAYER.onGround){
+      PLAYER.state = 'duck';
+      PLAYER.h = 32;
+      PLAYER.y = GROUND_Y - PLAYER.h;
+    } else if (!d && PLAYER.onGround){
+      PLAYER.state = 'run';
+      PLAYER.h = 48;
+      PLAYER.y = GROUND_Y - PLAYER.h;
+    }
+  }
+
+  window.addEventListener('keydown', e => {
+    const c = e.code;
+    if (c==='Space' || c==='ArrowUp' || c==='KeyW'){
+      e.preventDefault();
+      if (tryStartOrRestart()) return;
+      jump();
+    }
+    if (c==='ArrowDown' || c==='KeyS') duck(true);
+  });
+  window.addEventListener('keyup', e => {
+    const c = e.code;
+    if (c==='ArrowDown' || c==='KeyS') duck(false);
+  });
+  canvas.addEventListener('pointerdown', () => { if (tryStartOrRestart()) return; jump(); });
+  ovBtn.addEventListener('click', tryStartOrRestart);
+
+  // ---------- Spawning ----------
+  function spawnGroundObstacle(t){
+    // Разнообразие толщины/высоты
+    const w = randInt(14, 32);
+    const h = randInt(32, 56);
+    // один верхний шип
+    const spikeW = randInt(Math.max(4, (w*0.25)|0), Math.max(6, (w*0.4)|0));
+    const spikeH = randInt(8, 16);
+
+    obstacles.push({ kind:'cactus', x:WIDTH+10, y:GROUND_Y-h, w, h, spikeW, spikeH });
+    if (obstacles.length > MAX_OBSTACLES) obstacles.shift();
+
+    lastObstacleAt = t;
+    nextGroundAt = t + randInt(850, 1400);
+  }
+
+  function spawnBird(t){
+    const levels = [GROUND_Y-90, GROUND_Y-120, GROUND_Y-60];
+    const y = levels[(Math.random()*levels.length)|0];
+    obstacles.push({ kind:'bird', x:WIDTH+10, y:y-24, w:46, h:32, frame:0, frameTime:0 });
+    if (obstacles.length > MAX_OBSTACLES) obstacles.shift();
+
+    lastObstacleAt = t;
+    nextBirdAt = t + randInt(1400, 2200);
+  }
+
+  function spawnCloud(t){
+    const y = 40 + Math.random()*100;
+    clouds.push({ x:WIDTH+20, y, w:46, h:14, speed:speed*0.3 });
+    if (clouds.length > MAX_CLOUDS) clouds.shift();
+
+    nextCloudAt = t + randInt(CLOUD_MIN, CLOUD_MAX);
+  }
+
+  // ---------- Loop ----------
+  function loop(now){
+    if (!running) return;
+    const dt = now - last;
+    last = now;
+
+    update(dt, now);
+    render();
+
+    if (running) requestAnimationFrame(loop);
+  }
+
+  function update(dt, now){
+    if (over) return;
+
+    // day/night
+    dayNightTimer += dt;
+    if (dayNightTimer >= DAY_NIGHT_EVERY){
+      isNight = !isNight;
+      dayNightTimer = 0;
+      if (isNight) initStars();
+    }
+
+    // speed & score
+    speed += SPEED_INC * dt;
+    score += dt * 0.01;
+
+    // physics
+    if (!PLAYER.onGround){
+      PLAYER.vy += GRAVITY * dt;
+      PLAYER.y += PLAYER.vy * dt;
+      if (PLAYER.y >= GROUND_Y - PLAYER.h){
+        PLAYER.y = GROUND_Y - PLAYER.h;
+        PLAYER.vy = 0;
+        PLAYER.onGround = true;
+        PLAYER.state = 'run';
+      }
+    }
+
+    // anim
+    if (PLAYER.state==='run'){
+      PLAYER.runFrameTime = (PLAYER.runFrameTime||0)+dt;
+      if (PLAYER.runFrameTime > RUN_FRAME_TIME){
+        PLAYER.runFrameTime = 0;
+        PLAYER.runFrame = (PLAYER.runFrame+1)%2;
+      }
+    }
+
+    // spawn schedule (сильно меньше rand'ов и условий)
+    if (now - lastObstacleAt > OBST_COOLDOWN) {
+      if (now >= nextGroundAt) spawnGroundObstacle(now);
+      if (score > 250 && now >= nextBirdAt) {
+        // 50/50 ground or bird, но оба не появятся в один кадр из-за кулдауна
+        if (Math.random() < 0.5) spawnBird(now);
+      }
+    }
+    if (!isNight && now >= nextCloudAt) spawnCloud(now);
+
+    // move obstacles
+    const dx = speed * dt;
+    for (let i=0;i<obstacles.length;i++){
+      const o = obstacles[i];
+      o.x -= dx;
+      if (o.kind==='bird'){
+        o.frameTime += dt;
+        if (o.frameTime > BIRD_FRAME_TIME){
+          o.frameTime = 0;
+          o.frame = (o.frame+1)&1;
+        }
+      }
+    }
+    while (obstacles.length && obstacles[0].x + (obstacles[0].w||0) < -50) obstacles.shift();
+
+    // clouds
+    for (let i=0;i<clouds.length;i++) clouds[i].x -= clouds[i].speed * dt;
+    while (clouds.length && clouds[0].x + clouds[0].w < -50) clouds.shift();
+
+    // collisions
+    const pbox = getPlayerHitbox();
+    for (let i=0;i<obstacles.length;i++){
+      const o = obstacles[i];
+      const box = obstacleHitbox(o);
+      if (rectsIntersect(pbox, box)){
+        over = true;
+        running = false;
+        state = 'gameover';
+        if (score > best){
+          best = score;
+          localStorage.setItem('neon_dino_best', Math.floor(best));
+        }
+        showGameOver();
+        break;
+      }
+    }
+  }
+
+  function render(){
+    ctx.fillStyle = isNight ? BG_NIGHT : BG_DAY;
+    ctx.fillRect(0,0,WIDTH,HEIGHT);
+
+    // stars / clouds
+    if (isNight){
+      ctx.fillStyle = NEON;
+      for (const s of stars){
+        ctx.globalAlpha = s.a;
+        ctx.beginPath();
+        ctx.arc(s.x|0, s.y|0, s.r, 0, Math.PI*2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    } else {
+      ctx.fillStyle = '#1f1f1f';
+      for (const c of clouds) drawCloud(c.x|0, c.y|0, 22, 10);
+    }
+
+    // ground
+    ctx.strokeStyle = NEON;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, (GROUND_Y+0.5)|0);
+    ctx.lineTo(WIDTH, (GROUND_Y+0.5)|0);
+    ctx.stroke();
+
+    // obstacles
+    ctx.fillStyle = NEON;
+    for (const o of obstacles){
+      if (o.kind==='cactus') drawCactus(o);
+      else drawBird(o);
+    }
+
+    // player
+    drawPlayer();
+
+    // UI
+    ctx.fillStyle = NEON;
+    ctx.font = 'bold 18px monospace';
+    ctx.fillText(`SCORE ${String(Math.floor(score)).padStart(5,'0')}`, WIDTH - 160, 28);
+    ctx.fillText(`BEST  ${String(Math.floor(best)).padStart(5,'0')}`,  WIDTH - 160, 48);
+  }
+
+  // ---------- Draw ----------
+  function drawPlayer(){
+    if (charImg.complete && charImg.naturalWidth){
+      ctx.drawImage(charImg, PLAYER.x|0, PLAYER.y|0, PLAYER.w|0, PLAYER.h|0);
+    } else {
+      ctx.fillStyle = NEON;
+      ctx.fillRect(PLAYER.x|0, PLAYER.y|0, PLAYER.w|0, PLAYER.h|0);
+    }
+  }
+
+  function drawCactus(o){
+    const x = o.x|0, y = o.y|0, w = o.w|0, h = o.h|0;
+    ctx.fillRect(x, y, w, h);
+    const spikeX = (x + (w>>1) - (o.spikeW>>1))|0;
+    const spikeY = (y - o.spikeH)|0;
+    ctx.fillRect(spikeX, spikeY, o.spikeW|0, o.spikeH|0);
+  }
+
+  function drawBird(o){
+    const x = o.x|0, y = o.y|0, w = o.w|0;
+    ctx.fillRect(x, y+10, w-6, 14);
+    ctx.fillRect(x+w-10, y+4, 8, 8);
+    ctx.fillRect(x+w-2,  y+7, 4, 4);
+    if (o.frame===0) ctx.fillRect(x+10, y, 18, 8);
+    else             ctx.fillRect(x+10, y+20, 18, 6);
+  }
+
+  function drawCloud(x,y,w,h){
+    ctx.beginPath();
+    ctx.ellipse(x, y, w, h, 0, 0, Math.PI*2);
+    ctx.ellipse(x+18, y-6, w*0.75, h*0.75, 0, 0, Math.PI*2);
+    ctx.ellipse(x+36, y+2, w*0.9, h*0.9, 0, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // ---------- Collision helpers ----------
+  function obstacleHitbox(o){
+    // у кактуса весь прямоугольник тела + шип (чуть выше, но мы уже включили высоту в y/h через spikeY? — нет.
+    // Для простоты достаточно тела: шип всё равно над ним, игрок обычно врезается в тело.
+    if (o.kind==='cactus') return { x:o.x, y:o.y, w:o.w, h:o.h + o.spikeH };
+    return { x:o.x, y:o.y, w:o.w, h:o.h };
+  }
+  function getPlayerHitbox(){ return { x: PLAYER.x+6, y: PLAYER.y+4, w: PLAYER.w-12, h: PLAYER.h-8 }; }
+  function rectsIntersect(a,b){ return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y; }
+
+  // ---------- Utils ----------
+  function randInt(min,max){ return (Math.random()*(max-min+1) + min) | 0; }
+
+  // start
+  showStart();
+})();
+</script>
+</body>
+</html>
